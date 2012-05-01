@@ -50,35 +50,36 @@ static uint8_t      RxLength;
  *  within a device can be differentiated from one another.
  */
 USB_ClassInfo_CDC_Device_t VirtualSerial_CDC_Interface =
-    {
-        .Config =
-            {
-                .ControlInterfaceNumber         = 0,
-                .DataINEndpoint                 =
-                    {
-                        .Address                = CDC_TX_EPADDR,
-                        .Size                   = CDC_TXRX_EPSIZE,
-                        .Banks                  = 1,
-                    },
-                .DataOUTEndpoint                =
-                    {
-                        .Address                = CDC_RX_EPADDR,
-                        .Size                   = CDC_TXRX_EPSIZE,
-                        .Banks                  = 1,
-                    },
-                .NotificationEndpoint           =
-                    {
-                        .Address                = CDC_NOTIFICATION_EPADDR,
-                        .Size                   = CDC_NOTIFICATION_EPSIZE,
-                        .Banks                  = 1,
-                    },
-            },
-    };
+	{
+		.Config =
+			{
+				.ControlInterfaceNumber         = 0,
+				.DataINEndpoint                 =
+					{
+						.Address                = CDC_TX_EPADDR,
+						.Size                   = CDC_TXRX_EPSIZE,
+						.Banks                  = 1,
+					},
+				.DataOUTEndpoint                =
+					{
+						.Address                = CDC_RX_EPADDR,
+						.Size                   = CDC_TXRX_EPSIZE,
+						.Banks                  = 1,
+					},
+				.NotificationEndpoint           =
+					{
+						.Address                = CDC_NOTIFICATION_EPADDR,
+						.Size                   = CDC_NOTIFICATION_EPSIZE,
+						.Banks                  = 1,
+					},
+			},
+	};
 
-void RingBuffer_InsertString( char* p )
+static uint8_t RxTimeout;
+void RingBuffer_InsertString( RingBuffer_t* buff, char* s )
 {
     char* lp;
-    for ( lp = p; *lp; lp++ ) RingBuffer_Insert( &RF12toUSB_Buffer, *lp );
+    for ( lp = s; *lp; lp++ ) RingBuffer_Insert( buff, *lp );
 }
 
 /** Main program entry point. This routine contains the overall program flow, including initial
@@ -86,14 +87,14 @@ void RingBuffer_InsertString( char* p )
  */
 int main(void)
 {
-    SetupHardware();
+	SetupHardware();
 
-    RingBuffer_InitBuffer(&RF12toUSB_Buffer, RF12toUSB_Buffer_Data, sizeof(RF12toUSB_Buffer_Data));
+	RingBuffer_InitBuffer(&RF12toUSB_Buffer, RF12toUSB_Buffer_Data, sizeof(RF12toUSB_Buffer_Data));
 
-    sei();
+	sei();
 
-    for (;;)
-    {
+	for (;;)
+	{
         /* Not interested in any data from the host so just read and discard */
         (void) CDC_Device_ReceiveByte(&VirtualSerial_CDC_Interface);
 
@@ -112,6 +113,12 @@ int main(void)
         {
             uint8_t ch = RFM12B_SPI_Transfer( 0xB000 ) & 0xFF;
 
+            RingBuffer_Insert( &RF12toUSB_Buffer, 
+                               "0123456789ABCDEF"[ ch >> 4 ] );            
+            RingBuffer_Insert( &RF12toUSB_Buffer, 
+                               "0123456789ABCDEF"[ ch & 0xF ] );            
+            RingBuffer_Insert( &RF12toUSB_Buffer, ' ' );
+
             /* A character has been received, check the value of RxLength
                if it's zero then the byte just received must be the length
                byte, so grab it */
@@ -119,13 +126,10 @@ int main(void)
             if ( RxLength == 0 )
             {
                 RxLength = ch;
+                RxTimeout = 0;
             }
             else
             {
-                /* If RxLength is not zero then we are receiving payload
-                   bytes so send to the host via USB */
-                
-                RingBuffer_Insert( &RF12toUSB_Buffer, ch );            
                 if ( --RxLength == 0 )
                 {
                     /* Decrement the RxLength for each byte of payload received.
@@ -134,46 +138,59 @@ int main(void)
                     
                     RFM12B_SPI_Transfer( 0xCA81 );
                     RFM12B_SPI_Transfer( 0xCA83 );
+                    RingBuffer_InsertString( &RF12toUSB_Buffer, "]\n[ " );
+
                 }
             }
         }
         
-        /* Check if the UART receive buffer flush timer has expired or the buffer is nearly full */
-        uint16_t BufferCount = RingBuffer_GetCount(&RF12toUSB_Buffer);
-        if ((TIFR0 & (1 << TOV0)) || (BufferCount > (uint8_t)(sizeof(RF12toUSB_Buffer_Data) * .75)))
+		/* Count the number of times that the flush timer overflows
+           this should increment the RxTimeout every 4.096ms            */
+        if (RxLength && (TIFR0 & (1 << TOV0)) && (++RxTimeout > 12))
         {
-            /* Clear flush timer expiry flag */
-            TIFR0 |= (1 << TOV0);
-
-            /* Read bytes from the USART receive buffer into the USB IN endpoint */
-            while (BufferCount--)
-            {
-                /* Try to send the next byte of data to the host, abort if there is an error without dequeuing */
-                if (CDC_Device_SendByte(&VirtualSerial_CDC_Interface,
-                                        RingBuffer_Peek(&RF12toUSB_Buffer)) != ENDPOINT_READYWAIT_NoError)
-                {
-                    break;
-                }
-
-                /* Dequeue the already sent byte from the buffer now we have confirmed that no transmission error occurred */
-                RingBuffer_Remove(&RF12toUSB_Buffer);
-            }
+            RFM12B_SPI_Transfer( 0xCA81 );
+            RFM12B_SPI_Transfer( 0xCA83 );
+            RingBuffer_InsertString( &RF12toUSB_Buffer, "] *TIMEOUT*\n[ " );
+            RxLength = 0;
         }
 
-        CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
-        USB_USBTask();
-    }
+        
+        /* Check if the UART receive buffer flush timer has expired or the buffer is nearly full */
+		uint16_t BufferCount = RingBuffer_GetCount(&RF12toUSB_Buffer);
+		if ((TIFR0 & (1 << TOV0)) || (BufferCount > (uint8_t)(sizeof(RF12toUSB_Buffer_Data) * .75)))
+		{
+			/* Clear flush timer expiry flag */
+			TIFR0 |= (1 << TOV0);
+
+			/* Read bytes from the USART receive buffer into the USB IN endpoint */
+			while (BufferCount--)
+			{
+				/* Try to send the next byte of data to the host, abort if there is an error without dequeuing */
+				if (CDC_Device_SendByte(&VirtualSerial_CDC_Interface,
+				                        RingBuffer_Peek(&RF12toUSB_Buffer)) != ENDPOINT_READYWAIT_NoError)
+				{
+					break;
+				}
+
+				/* Dequeue the already sent byte from the buffer now we have confirmed that no transmission error occurred */
+				RingBuffer_Remove(&RF12toUSB_Buffer);
+			}
+		}
+
+		CDC_Device_USBTask(&VirtualSerial_CDC_Interface);
+		USB_USBTask();
+	}
 }
 
 /** Configures the board hardware and chip peripherals for the demo's functionality. */
 void SetupHardware(void)
 {
-    /* Disable watchdog if enabled by bootloader/fuses */
-    MCUSR &= ~(1 << WDRF);
-    wdt_disable();
+	/* Disable watchdog if enabled by bootloader/fuses */
+	MCUSR &= ~(1 << WDRF);
+	wdt_disable();
 
-    /* Disable clock division */
-    clock_prescale_set(clock_div_1);
+	/* Disable clock division */
+	clock_prescale_set(clock_div_1);
 
     RFM12B_SPI_Init();
 
@@ -203,26 +220,26 @@ void SetupHardware(void)
     RxLength = 0;
     RFM12B_SPI_Transfer(0x82DD);  /* Turn Receiver On */
 
-    /* Hardware Initialization */
-    LEDs_Init();
-    USB_Init();
+	/* Hardware Initialization */
+	LEDs_Init();
+	USB_Init();
 
-    /* Start the flush timer so that overflows occur rapidly to push received bytes to the USB interface */
-    TCCR0B = (1 << CS02);
+	/* Start the flush timer so that overflows occur rapidly to push received bytes to the USB interface */
+	TCCR0B = (1 << CS02);
 }
 
 /** Event handler for the library USB Configuration Changed event. */
 void EVENT_USB_Device_ConfigurationChanged(void)
 {
-    bool ConfigSuccess = true;
+	bool ConfigSuccess = true;
 
-    ConfigSuccess &= CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
+	ConfigSuccess &= CDC_Device_ConfigureEndpoints(&VirtualSerial_CDC_Interface);
 
-    LEDs_SetAllLEDs(ConfigSuccess ? LEDMASK_USB_READY : LEDMASK_USB_ERROR);
+	LEDs_SetAllLEDs(ConfigSuccess ? LEDMASK_USB_READY : LEDMASK_USB_ERROR);
 }
 
 /** Event handler for the library USB Control Request reception event. */
 void EVENT_USB_Device_ControlRequest(void)
 {
-    CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
+	CDC_Device_ProcessControlRequest(&VirtualSerial_CDC_Interface);
 }
